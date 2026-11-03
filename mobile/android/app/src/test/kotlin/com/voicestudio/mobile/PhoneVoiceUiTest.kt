@@ -4,18 +4,30 @@ import android.app.Application
 import android.os.Looper
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.semantics.ProgressBarRangeInfo
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.lifecycle.viewModelScope
 import androidx.test.core.app.ApplicationProvider
 import com.voicestudio.mobile.data.*
+import com.voicestudio.mobile.designsystem.VoiceStudioTheme
+import com.voicestudio.mobile.features.LocalL10n
+import com.voicestudio.mobile.features.PhoneState
+import com.voicestudio.mobile.features.PhoneStudio
+import com.voicestudio.mobile.features.StudioState
 import com.voicestudio.mobile.features.StudioViewModel
+import com.voicestudio.mobile.features.voices.VoicesScreen
+import com.voicestudio.mobile.l10n.L10n
 import com.voicestudio.mobile.local.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.serialization.json.Json
 import org.junit.*
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.mockito.Mockito.*
 import java.io.File
 import java.util.UUID
 
@@ -23,6 +35,52 @@ import java.util.UUID
 @Config(sdk=[34])
 class PhoneVoiceUiTest {
     @get:Rule val compose=createComposeRule()
+    @Test fun cloneFormShowsPhoneProgressAndProtectsTheSampleUntilCancellation() {
+        val app=ApplicationProvider.getApplicationContext<Application>()
+        val l=L10n.load(app,"en")
+        val models=listOf("asr","clone").map {capability ->
+            PhoneModel("fixture-$capability",capability,"sherpa-onnx","org/model","a".repeat(40),
+                emptyList(),1,listOf("en"),1.0,ModelLicence("mit","commercial-ok",false,"","","b".repeat(64)))
+        }
+        val phoneState=MutableStateFlow(PhoneState(models=models,installed=models.map {it.id}.toSet(),loading=false))
+        val phone=mock(PhoneStudio::class.java)
+        `when`(phone.state).thenReturn(phoneState)
+        `when`(phone.ramBytes).thenReturn(16_000_000_000L)
+        val vm=mock(StudioViewModel::class.java)
+        `when`(vm.phone).thenReturn(phone)
+        val hostState=MutableStateFlow(StudioState(loading=false))
+        `when`(vm.state).thenReturn(hostState)
+        `when`(vm.preferences).thenReturn(MutableStateFlow(Preferences()))
+        compose.setContent {
+            CompositionLocalProvider(LocalL10n provides l) {
+                VoiceStudioTheme {VoicesScreen(vm,initialCreating=true)}
+            }
+        }
+        compose.onNodeWithText(l.t("mobile.voices.pick_file")).performScrollTo().assertIsEnabled()
+        val progress=SemanticsMatcher.keyIsDefined(SemanticsProperties.ProgressBarRangeInfo)
+        for(value in listOf(0f,.65f)) {
+            compose.runOnIdle {phoneState.value=phoneState.value.copy(progress=value)}
+            compose.onNodeWithContentDescription(l.t("mobile.ios.progress")).assertIsDisplayed()
+                .assert(SemanticsMatcher.expectValue(SemanticsProperties.ProgressBarRangeInfo,ProgressBarRangeInfo(value,0f..1f)))
+            compose.onNodeWithText(l.t("mobile.voices.pick_file")).assertIsNotEnabled()
+            compose.onNodeWithText(l.t("mobile.voices.record")).assertIsNotEnabled()
+            compose.onNodeWithText(l.t("mobile.voices.new_clone")).assertIsNotEnabled()
+        }
+        compose.runOnIdle {phoneState.value=phoneState.value.copy(progress=null);hostState.value=hostState.value.copy(busy=true)}
+        compose.onNode(progress).assertIsDisplayed()
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.ProgressBarRangeInfo,ProgressBarRangeInfo.Indeterminate))
+        compose.onNodeWithText(l.t("mobile.voices.pick_file")).assertIsNotEnabled()
+        compose.onNodeWithText(l.t("mobile.voices.record")).assertIsNotEnabled()
+        compose.runOnIdle {hostState.value=hostState.value.copy(busy=false)}
+        compose.onNode(progress).assertDoesNotExist()
+        compose.onNodeWithText(l.t("mobile.voices.pick_file")).assertIsEnabled()
+        compose.onNodeWithText(l.t("mobile.voices.record")).assertIsEnabled()
+        compose.onNodeWithText("Cancel").assertIsDisplayed().performClick()
+        verify(phone,atLeastOnce()).cancelInference()
+        compose.onNode(progress).assertDoesNotExist()
+        compose.onNodeWithText("Voice name").assertDoesNotExist()
+    }
+
     @Test fun phoneVoiceCanBeRenamedDeletedAndSelectedWithoutComputer()=runBlocking {
         val app=ApplicationProvider.getApplicationContext<Application>()
         val id=UUID.randomUUID().toString()
